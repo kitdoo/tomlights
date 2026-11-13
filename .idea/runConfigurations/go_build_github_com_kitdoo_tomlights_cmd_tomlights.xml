@@ -1,0 +1,14 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="go build github.com/kitdoo/tomlights/cmd/tomlights" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+    <module name="tomlights" />
+    <working_directory value="$PROJECT_DIR$" />
+    <go_parameters value="-ldflags &quot;-X github.com/altessa-s/go-atlas/core/runtime/appinfo.Name=lghts -X  github.com/altessa-s/go-atlas/core/runtime/appinfo.Project=one2work -X  github.com/altessa-s/go-atlas/core/runtime/appinfo.Build=development&quot;" />
+    <useCustomBuildTags value="true" />
+    <parameters value="server run" />
+    <kind value="PACKAGE" />
+    <package value="github.com/kitdoo/tomlights/cmd/tomlights" />
+    <directory value="$PROJECT_DIR$" />
+    <auto_managed_config_id value="$PROJECT_DIR$/cmd/tomlights" />
+    <method v="2" />
+  </configuration>
+</component>

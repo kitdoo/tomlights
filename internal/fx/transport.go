@@ -1,0 +1,192 @@
+package fx
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"buf.build/go/protovalidate"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/fx"
+
+	"github.com/altessa-s/go-atlas/observability/tracing"
+	"github.com/altessa-s/go-atlas/transport/grpc/handlers/health"
+	"github.com/altessa-s/go-atlas/transport/grpc/handlers/serviceinfo"
+	"github.com/altessa-s/go-atlas/transport/grpc/interceptors"
+	"github.com/altessa-s/go-atlas/transport/grpc/interceptors/protovalidator"
+
+	"github.com/kitdoo/tomlights/internal/pkg/appconfig"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	coreerrs "github.com/altessa-s/go-atlas/core/errors"
+	obshealth "github.com/altessa-s/go-atlas/observability/health"
+	slogx "github.com/altessa-s/go-atlas/observability/slog"
+	tlsproviders "github.com/altessa-s/go-atlas/security/tlsutils/providers"
+	atlasid "github.com/altessa-s/go-atlas/service/id"
+	grpcserver "github.com/altessa-s/go-atlas/transport/grpc/server"
+	grpcfactory "github.com/altessa-s/go-atlas/transport/grpc/server/factory"
+	httpserver "github.com/altessa-s/go-atlas/transport/http/server"
+	httpfactory "github.com/altessa-s/go-atlas/transport/http/server/factory"
+	httphealth "github.com/altessa-s/go-atlas/transport/http/server/handlers/health"
+	httpping "github.com/altessa-s/go-atlas/transport/http/server/handlers/ping"
+	httpwriter "github.com/altessa-s/go-atlas/transport/http/server/writer"
+)
+
+// httpInternalPrefix mirrors the default internal prefix used by the
+// go-atlas HTTP factory for probes/metrics/pprof.
+const httpInternalPrefix = "/internal"
+
+// TransportsModule wires the gRPC and HTTP servers and their handlers.
+func TransportsModule() fx.Option {
+	return fx.Module("transports",
+		fx.Provide(newGRPCServer),
+		fx.Provide(newHTTPServer),
+
+		fx.Provide(AsGRPCHandler(newServiceInfoHandler)),
+		fx.Provide(AsGRPCHandler(health.New)),
+
+		fx.Provide(AsGRPCInterceptor(newProtoValidatorInterceptor)),
+
+		fx.Invoke(fx.Annotate(registerGRPCHandlers, fx.ParamTags(`group:"grpc-interceptors"`, `group:"grpc-handlers"`))),
+
+		// Force HTTP server construction even when no other consumer depends on it.
+		fx.Invoke(func(*httpserver.Server) {}),
+	)
+}
+
+func registerGRPCHandlers(intrs []interceptors.ServerInterceptor, handlers []grpcserver.Handler, srv *grpcserver.Server) error {
+	if err := srv.RegisterInterceptors(intrs...); err != nil {
+		return coreerrs.WrapOperation(err, "register gRPC interceptors")
+	}
+	srv.RegisterHandlers(handlers...)
+	return nil
+}
+
+// AsGRPCHandler annotates a constructor function to provide a gRPC handler
+// into the `grpc-handlers` group consumed by [registerGRPCHandlers].
+func AsGRPCHandler(f any) any {
+	return fx.Annotate(f, fx.As(new(grpcserver.Handler)),
+		fx.ResultTags(`group:"grpc-handlers"`))
+}
+
+// AsGRPCInterceptor annotates a constructor function to provide a gRPC
+// server interceptor into the `grpc-interceptors` group consumed by
+// [registerGRPCHandlers].
+func AsGRPCInterceptor(f any) any {
+	return fx.Annotate(f, fx.As(new(interceptors.ServerInterceptor)),
+		fx.ResultTags(`group:"grpc-interceptors"`))
+}
+
+func newGRPCServer(
+	cfg *appconfig.Config,
+	providers *tlsproviders.Providers,
+	tracer tracing.Tracer,
+	hc *obshealth.Coordinator,
+	lc fx.Lifecycle,
+) (*grpcserver.Server, error) {
+	logger := slog.Default().With(slogx.Module("grpc"))
+
+	srv, err := grpcfactory.New(cfg.Grpc).
+		UseLogger(logger).
+		UseTlsProviders(providers).
+		UseTracer(tracer).
+		UseHealthChecker(&healthAdapter{hc}).
+		WithInterceptors().
+		Build()
+	if err != nil {
+		return nil, coreerrs.WrapOperation(err, "create gRPC server")
+	}
+
+	lc.Append(fx.StartHook(srv.Start))
+	lc.Append(fx.StopHook(srv.Shutdown))
+	return srv, nil
+}
+
+func newHTTPServer(
+	cfg *appconfig.Config,
+	providers *tlsproviders.Providers,
+	tracer tracing.Tracer,
+	hc *obshealth.Coordinator,
+	lc fx.Lifecycle,
+) (*httpserver.Server, error) {
+	if cfg.Http == nil {
+		return nil, nil //nolint:nilnil // HTTP server is optional
+	}
+
+	builder := httpfactory.New(cfg.Http).
+		UseLogger(slog.Default().With(slogx.Module("http"))).
+		UseTlsProviders(providers).
+		UseTracer(tracer).
+		WithMiddlewares().
+		WithoutBuiltinHandlers()
+
+	if cfg.Http.Pprof != nil && cfg.Http.Pprof.Enabled {
+		builder = builder.WithPprof()
+	}
+
+	srv, err := builder.Build()
+	if err != nil {
+		return nil, coreerrs.WrapOperation(err, "create HTTP server")
+	}
+
+	registerInternalHandlers(srv, hc)
+
+	lc.Append(fx.StartHook(srv.Start))
+	lc.Append(fx.StopHook(srv.Shutdown))
+	return srv, nil
+}
+
+// registerInternalHandlers wires /internal/{ping,healthz,readyz,metrics} for
+// liveness, readiness, and Prometheus scraping.
+func registerInternalHandlers(srv *httpserver.Server, hc *obshealth.Coordinator) {
+	srv.Handle(httpInternalPrefix+"/ping", httpping.Handler).Methods(http.MethodGet)
+	srv.Handle(httpInternalPrefix+"/healthz", httphealth.K8sHealtz).Methods(http.MethodGet)
+	srv.Handle(httpInternalPrefix+"/readyz", httphealth.Readyz(hc)).Methods(http.MethodGet)
+	srv.Handle(httpInternalPrefix+"/healthz/details", httphealth.Detailed(hc)).Methods(http.MethodGet)
+	srv.Handle(httpInternalPrefix+"/metrics/", prometheusMetrics).Methods(http.MethodGet)
+}
+
+func prometheusMetrics(rw httpwriter.ReadWriter) {
+	promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{DisableCompression: true},
+	).ServeHTTP(rw.ResponseWriter(), rw.Request())
+}
+
+func newServiceInfoHandler(sid *atlasid.Service) *serviceinfo.Handler {
+	return serviceinfo.New(serviceinfo.WithServiceID(sid.ID()))
+}
+
+// newProtoValidatorInterceptor enforces every `buf.validate.field` rule
+// declared on request messages. On a violation the message is formatted as
+// "<field>: <reason>" so the web BFF can attribute it to a form field.
+func newProtoValidatorInterceptor() (interceptors.ServerInterceptor, error) {
+	pv, err := protovalidate.New()
+	if err != nil {
+		return nil, coreerrs.WrapOperation(err, "create protovalidate validator")
+	}
+
+	validatorFn := protovalidator.ValidatorFunc(func(_ context.Context, msg proto.Message) error {
+		err := pv.Validate(msg)
+		if err == nil {
+			return nil
+		}
+
+		var verr *protovalidate.ValidationError
+		if errors.As(err, &verr) && len(verr.Violations) > 0 {
+			v := verr.Violations[0].Proto
+			if field := protovalidate.FieldPathString(v.GetField()); field != "" {
+				return status.Error(codes.InvalidArgument, field+": "+v.GetMessage())
+			}
+			return status.Error(codes.InvalidArgument, v.GetMessage())
+		}
+		return status.Error(codes.InvalidArgument, err.Error())
+	})
+
+	return protovalidator.ServerInterceptor(validatorFn), nil
+}

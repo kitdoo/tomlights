@@ -1,0 +1,87 @@
+# Bounded JSON-file logging for every service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${LOG_MAX_SIZE:-10m}"
+    max-file: "${LOG_MAX_FILE:-5}"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    logging: *default-logging
+    # MONGO_INITDB_ROOT_USERNAME/PASSWORD come from .env.
+    env_file:
+      - .env
+    volumes:
+      - mongo_data:/data/db
+    # Published to localhost only, so `make run` / Compass can reach it.
+    # Set MONGO_PORT if 27017 is already taken on the host.
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/kitdoo/tomlights:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: tomlights
+        APP_VERSION: ${APP_VERSION:-dev}
+        APP_VERSION_COMMIT: ${APP_VERSION_COMMIT:-local}
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["server", "run", "-c", "/app/configs"]
+    volumes:
+      - ./configs:/app/configs:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+    # No published ports: gRPC (7779) / HTTP (9080) are reached by web over
+    # the compose-internal network only.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9080/internal/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    env_file:
+      - .env
+    # `environment` wins over env_file: point the shared .env at the
+    # compose network instead of localhost.
+    environment:
+      GRPC__LISTEN_ADDRESS: 0.0.0.0:7779
+      HTTP__LISTEN_ADDRESS: 0.0.0.0:9080
+      MONGODB__HOSTS: "[mongo:27017]"
+      LOGGER__OUTPUT_FORMAT: json
+      LOGGER__COLORIZED: "false"
+      # Use the standard /var/lib, /etc, ... paths inside the container.
+      BIN_DIR: ""
+      VAR_DIR: ""
+      LIB_DIR: ""
+      ETC_DIR: ""
+
+  web:
+    image: ghcr.io/kitdoo/tomlights-web:${IMAGE_TAG:-latest}
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      NUXT_GRPC_BASE_URL: backend:7779
+      NUXT_GRPC_TIMEOUT_MS: ${NUXT_GRPC_TIMEOUT_MS:-15000}
+      NUXT_BACKEND_HTTP_URL: http://backend:9080
+
+volumes:
+  mongo_data:

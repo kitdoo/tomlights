@@ -1,0 +1,186 @@
+// Package mailer implements the mailer.Service interface over the
+// standard library's net/smtp.
+package mailer
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"fmt"
+	"net/smtp"
+	"strings"
+	"time"
+
+	"github.com/kitdoo/tomlights/internal/errs"
+
+	mailersvc "github.com/kitdoo/tomlights/internal/pkg/mailer"
+)
+
+var _ mailersvc.Service = (*Service)(nil)
+
+// implicitTLSPort is the SMTPS port that expects TLS from the first byte.
+const implicitTLSPort = 465
+
+// Config is the resolved SMTP connection/auth data a Service sends
+// through. Built from appconfig.SMTPConfig in internal/fx.
+type Config struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	From     string
+}
+
+// Service sends email over SMTP, auto-selecting implicit TLS (port 465,
+// dialed directly with crypto/tls) vs STARTTLS (any other port,
+// negotiated by net/smtp.SendMail itself when the server advertises it).
+type Service struct {
+	cfg *Config
+}
+
+// New builds a Service. cfg == nil yields a Service whose Send always
+// returns errs.ErrMailerNotConfigured — see AppConfig.Smtp being optional.
+func New(cfg *Config) *Service {
+	return &Service{cfg: cfg}
+}
+
+// Send delivers msg synchronously. On the implicit-TLS path ctx bounds the
+// dial; on the STARTTLS path net/smtp.SendMail offers no cancellation hook.
+func (s *Service) Send(ctx context.Context, msg mailersvc.Message) error {
+	if s.cfg == nil {
+		return errs.ErrMailerNotConfigured
+	}
+
+	body := buildMessage(s.cfg.From, msg)
+	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+
+	var auth smtp.Auth
+	if s.cfg.Username != "" {
+		auth = smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)
+	}
+
+	if s.cfg.Port == implicitTLSPort {
+		return sendImplicitTLS(ctx, addr, s.cfg.Host, auth, s.cfg.From, msg.To, body)
+	}
+	return smtp.SendMail(addr, auth, s.cfg.From, []string{msg.To}, body)
+}
+
+// buildMessage composes the raw RFC 5322 message. Date and Message-ID are
+// required by most receiving servers' spam filters — without them,
+// net/smtp.SendMail can succeed (SMTP accepts the message) while the
+// message is silently dropped or spam-boxed downstream, with no error
+// surfacing on our end. With Attachments present, the body switches from a
+// plain text/plain message to a multipart/mixed one (text part + one
+// application/octet-stream part per attachment, base64-encoded).
+func buildMessage(from string, msg mailersvc.Message) []byte {
+	displayFrom := from
+	if msg.FromName != "" {
+		displayFrom = fmt.Sprintf("%s <%s>", msg.FromName, from)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", displayFrom)
+	fmt.Fprintf(&b, "To: %s\r\n", msg.To)
+	fmt.Fprintf(&b, "Subject: %s\r\n", msg.Subject)
+	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "Message-ID: %s\r\n", newMessageID(from))
+	if msg.ReplyTo != "" {
+		fmt.Fprintf(&b, "Reply-To: %s\r\n", msg.ReplyTo)
+	}
+	b.WriteString("MIME-Version: 1.0\r\n")
+
+	if len(msg.Attachments) == 0 {
+		b.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+		b.WriteString("\r\n")
+		b.WriteString(msg.Body)
+		return []byte(b.String())
+	}
+
+	boundary := newBoundary()
+	fmt.Fprintf(&b, "Content-Type: multipart/mixed; boundary=\"%s\"\r\n\r\n", boundary)
+
+	fmt.Fprintf(&b, "--%s\r\n", boundary)
+	b.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n\r\n")
+	b.WriteString(msg.Body)
+	b.WriteString("\r\n")
+
+	for _, a := range msg.Attachments {
+		contentType := a.ContentType
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		fmt.Fprintf(&b, "--%s\r\n", boundary)
+		fmt.Fprintf(&b, "Content-Type: %s\r\n", contentType)
+		fmt.Fprintf(&b, "Content-Disposition: attachment; filename=\"%s\"\r\n", a.Filename)
+		b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+		b.WriteString(base64.StdEncoding.EncodeToString(a.Data))
+		b.WriteString("\r\n")
+	}
+	fmt.Fprintf(&b, "--%s--\r\n", boundary)
+
+	return []byte(b.String())
+}
+
+func newBoundary() string {
+	return "boundary-" + randomHex()
+}
+
+// newMessageID builds a unique Message-ID, using the domain part of from
+// (falling back to "localhost" if from has no "@") as required by RFC 5322.
+func newMessageID(from string) string {
+	domain := "localhost"
+	if i := strings.LastIndex(from, "@"); i >= 0 && i+1 < len(from) {
+		domain = from[i+1:]
+	}
+	return fmt.Sprintf("<%s@%s>", randomHex(), domain)
+}
+
+// sendImplicitTLS handles port 465, which expects TLS from the first
+// byte of the connection (unlike 587/25's plaintext-then-STARTTLS, which
+// smtp.SendMail already handles on its own).
+func sendImplicitTLS(ctx context.Context, addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
+	dialer := &tls.Dialer{Config: &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("dial smtp over tls: %w", err)
+	}
+	defer func() { _ = conn.Close() }() //nolint:errcheck // best-effort cleanup; client.Quit reports delivery errors
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return fmt.Errorf("create smtp client: %w", err)
+	}
+	defer func() { _ = client.Close() }() //nolint:errcheck // best-effort cleanup; client.Quit reports delivery errors
+
+	if auth != nil {
+		if err = client.Auth(auth); err != nil {
+			return fmt.Errorf("smtp auth: %w", err)
+		}
+	}
+	if err = client.Mail(from); err != nil {
+		return fmt.Errorf("smtp mail from: %w", err)
+	}
+	if err = client.Rcpt(to); err != nil {
+		return fmt.Errorf("smtp rcpt to: %w", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("smtp data: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("write smtp body: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close smtp body: %w", err)
+	}
+	return client.Quit()
+}
+
+// randomHex returns 16 random bytes hex-encoded. crypto/rand.Read never
+// returns an error on supported platforms (it panics instead), per its docs.
+func randomHex() string {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:]) //nolint:errcheck // documented to never fail
+	return fmt.Sprintf("%x", raw)
+}

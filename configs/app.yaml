@@ -1,0 +1,34 @@
+# Application (business-domain) configuration.
+# All parameters are commented out by default (template mode).
+# Every value can also be set from the environment with double-underscore
+# nested keys, e.g. APP__SMTP__HOST, APP__RESEND__API_KEY (see .env.example).
+
+#app:
+#  # <object> Outbound SMTP for the email sender (internal/pkg/mailer).
+#  # Optional: when neither smtp nor resend is configured, sending returns
+#  # errs.ErrMailerNotConfigured instead of failing app boot. Once the
+#  # section exists, host/port/from are required.
+#  smtp:
+#    # <string> SMTP server hostname.
+#    host: "smtp.gmail.com"
+#
+#    # <int> SMTP server port. 587 (STARTTLS) and 465 (implicit TLS) are
+#    # both supported.
+#    # Default value: 587
+#    port: 587
+#
+#    # <string> SMTP auth username. Leave unset to disable auth.
+#    username: "you@example.com"
+#
+#    # <string> SMTP auth password (app password for Gmail/etc).
+#    password: "change-me"
+#
+#    # <string> From address emails are sent as.
+#    from: "no-reply@example.com"
+#
+#  # <object> Delivery through the Resend HTTP API. Takes precedence over
+#  # smtp when both are set (direct SMTP from cloud/VPS IPs is commonly
+#  # blackholed; an HTTPS API call is not).
+#  resend:
+#    apiKey: "re_xxx"
+#    from: "no-reply@your-verified-domain.com"

@@ -1,0 +1,113 @@
+// Package resend implements the mailer.Service interface over the
+// Resend HTTP API (https://resend.com/docs/api-reference/emails/send-email),
+// as an alternative to the mailer/mailer package's direct-SMTP delivery —
+// direct SMTP to providers like Gmail is commonly blackholed from cloud/VPS
+// source IPs on reputation grounds, where an HTTPS API call is not.
+package resend
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/kitdoo/tomlights/internal/errs"
+
+	mailersvc "github.com/kitdoo/tomlights/internal/pkg/mailer"
+)
+
+const (
+	apiURL = "https://api.resend.com/emails"
+	// errorBodyLimit caps how much of a non-2xx response body is quoted
+	// back in the returned error.
+	errorBodyLimit = 4096
+)
+
+var _ mailersvc.Service = (*Service)(nil)
+
+// Config is the resolved Resend API auth/from data a Service sends
+// through. Built from appconfig.ResendConfig in internal/fx.
+type Config struct {
+	APIKey string
+	From   string
+}
+
+// Service sends email through the Resend HTTP API.
+type Service struct {
+	cfg    *Config
+	client *http.Client
+}
+
+// New builds a Service. cfg == nil yields a Service whose Send always
+// returns errs.ErrMailerNotConfigured — see AppConfig.Resend being optional.
+func New(cfg *Config) *Service {
+	return &Service{cfg: cfg, client: &http.Client{}}
+}
+
+type sendAttachment struct {
+	Filename string `json:"filename"`
+	Content  string `json:"content"` // base64
+}
+
+type sendRequest struct {
+	From        string           `json:"from"`
+	To          []string         `json:"to"`
+	Subject     string           `json:"subject"`
+	Text        string           `json:"text"`
+	ReplyTo     string           `json:"reply_to,omitempty"`
+	Attachments []sendAttachment `json:"attachments,omitempty"`
+}
+
+// Send delivers msg via a single POST to the Resend emails endpoint.
+func (s *Service) Send(ctx context.Context, msg mailersvc.Message) error {
+	if s.cfg == nil {
+		return errs.ErrMailerNotConfigured
+	}
+
+	attachments := make([]sendAttachment, 0, len(msg.Attachments))
+	for _, a := range msg.Attachments {
+		attachments = append(attachments, sendAttachment{
+			Filename: a.Filename,
+			Content:  base64.StdEncoding.EncodeToString(a.Data),
+		})
+	}
+
+	from := s.cfg.From
+	if msg.FromName != "" {
+		from = fmt.Sprintf("%s <%s>", msg.FromName, from)
+	}
+
+	body, err := json.Marshal(sendRequest{
+		From:        from,
+		To:          []string{msg.To},
+		Subject:     msg.Subject,
+		Text:        msg.Body,
+		ReplyTo:     msg.ReplyTo,
+		Attachments: attachments,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal resend request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build resend request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("call resend api: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // response already consumed
+
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit)) //nolint:errcheck // best-effort error detail
+		return fmt.Errorf("resend api returned %s: %s", resp.Status, respBody)
+	}
+	return nil
+}
