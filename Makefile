@@ -8,8 +8,8 @@ APP_ENV_PREFIX ?=
 APP_VERSION ?= v$(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
 APP_VERSION_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-GOOS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
-GOARCH ?= $(shell uname -m)
+GOOS ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
 GO_RACE_DETECTOR_ENABLE ?= 0
 COMPILER_FLAGS ?=
 
